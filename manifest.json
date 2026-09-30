@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hectorhache.omawifi",
+  "name": "OmaWiFi - Wi-Fi Anchor",
+  "version": "0.1.0",
+  "author": "@HectorHache",
+  "license": "MIT",
+  "description": "Anchors this machine to one access point of a multi-AP Wi-Fi network. Shows every access point of the network you are on with its band, channel and signal, and pins the connection to the one you pick.",
+  "homepage": "https://github.com/HectorHache/omarchy-omawifi",
+  "repository": "https://github.com/HectorHache/omarchy-omawifi",
+  "keywords": [
+    "wifi",
+    "wi-fi",
+    "network",
+    "access point",
+    "bssid",
+    "roaming",
+    "signal"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Wi-Fi Anchor",
+    "description": "One mark in the bar: anchored, drifted, roaming or offline, with the signal of the access point in use. Click for every access point of the network, and anchor to whichever you want.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "ssidOverride": "",
+      "band": "5 GHz",
+      "showSignal": true,
+      "refreshSeconds": 20,
+      "openRefreshSeconds": 5,
+      "pinBand": false,
+      "simpleRanking": false,
+      "showScores": true
+    },
+    "schema": [
+      {
+        "key": "ssidOverride",
+        "type": "string",
+        "label": "Network name",
+        "defaultValue": "",
+        "description": "Leave empty to follow the Wi-Fi network this machine is on. Set it only if you want the widget pinned to a particular network by name."
+      },
+      {
+        "key": "band",
+        "type": "enum",
+        "label": "Preferred band",
+        "options": [
+          "5 GHz",
+          "2.4 GHz",
+          "Both"
+        ],
+        "defaultValue": "5 GHz",
+        "description": "Which band the anchor aims at. 5 GHz is faster and usually has several access points of the same network to choose between; 2.4 GHz reaches further. Both lists everything and lets the ranking decide."
+      },
+      {
+        "key": "showSignal",
+        "type": "boolean",
+        "label": "Show the signal percentage",
+        "defaultValue": true,
+        "description": "The mark on its own says anchored, drifted, roaming or offline. The number beside it is the signal of the access point in use. Turn it off for a smaller footprint in the bar."
+      },
+      {
+        "key": "refreshSeconds",
+        "type": "integer",
+        "label": "Check the anchor every (seconds)",
+        "min": 10,
+        "max": 600,
+        "step": 5,
+        "defaultValue": 20,
+        "description": "How often the bar asks which access point the radio is on. This read does not scan, it only asks NetworkManager, so it costs nothing."
+      },
+      {
+        "key": "openRefreshSeconds",
+        "type": "integer",
+        "label": "Refresh the open panel every (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "While the panel is open. Short, because a panel is a live view: signal moves as you walk."
+      },
+      {
+        "key": "pinBand",
+        "type": "boolean",
+        "label": "Pin the band as well as the access point",
+        "defaultValue": false,
+        "description": "Off by default: pinning the access point alone is enough, and it lets the machine fall back to the other band when the anchored one is unreachable instead of refusing to connect. On: the profile demands this band too."
+      },
+      {
+        "key": "simpleRanking",
+        "type": "boolean",
+        "label": "Rank on signal alone",
+        "defaultValue": false,
+        "description": "Off, two coarse tie-breaks refine a close call: a channel that several neighbours also use is marked down, and so is a DFS channel, where radar detection can force a re-association. On, the strongest access point always wins outright."
+      },
+      {
+        "key": "showScores",
+        "type": "boolean",
+        "label": "Show the ranking score",
+        "defaultValue": true,
+        "description": "The number the order is decided by, next to each access point. Useful when two access points report the same signal percentage."
+      }
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+# Test scratch: the harness runs the script against a fake nmcli in here.
+/tmp/omawifi-test*/
+__pycache__/
+*.pyc
+
+# Development-only test harness (carries the Phase 1 script and a fake nmcli).
+# Kept locally for verification, never published.
+/tests/

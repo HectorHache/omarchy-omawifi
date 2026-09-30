@@ -1,0 +1,685 @@
+#!/usr/bin/env bash
+#
+# omawifi — pin this machine to one access point of a multi-AP SSID.
+#
+# A Wi-Fi network can publish the same SSID from several access points: one per
+# band, one per floor. NetworkManager treats them as one network and picks an AP
+# by its own rules, so after sleep/wake the radio often lands on a distant AP
+# rather than the nearest one. The fix is to write the BSSID of the AP you want
+# into the connection profile, which is what this script does.
+#
+# Nothing here is specific to one machine or one network: the SSID is taken from
+# the environment, or from whatever Wi-Fi connection is up right now.
+#
+# Commands:
+#   omawifi                 pick the best AP of the target band and bind to it
+#   omawifi list            every visible AP of the SSID, ranked best first
+#   omawifi status          iface, current BSSID, pinned BSSID, band, state
+#   omawifi bind <BSSID>    bind to that exact AP
+#   omawifi ui              one JSON snapshot of the state, for the bar plugin
+#   omawifi auto            drop the pin, let NetworkManager roam freely again
+#
+# Flags:
+#   -n, --dry-run           print what would change, change nothing
+#       --fast              skip the forced rescan (use cached scan results)
+#       --band a|bg|auto    target band, default a (5 GHz)
+#       --pin-band          also pin the band (default: BSSID only)
+#       --simple            rank by raw signal only, no congestion/DFS tie-breaks
+#       --tsv               (list) tab separated, adds the ranking score
+#       --all               (list, ui) include 2.4 GHz APs
+#   -q, --quiet             minimal output
+#   -h, --help              this help
+#
+# Env overrides: OMAWIFI_SSID OMAWIFI_IFACE OMAWIFI_PROFILE OMAWIFI_VERIFY_TRIES
+#                OMAWIFI_TIE_WINDOW OMAWIFI_MAX_CANDIDATES
+#
+# The Wi-Fi passphrase is never read, printed or changed: the existing profile
+# already holds it, this script only rewrites 802-11-wireless.bssid.
+#
+# Needs bash, awk, nmcli and (optionally) iw — all shipped by Omarchy.
+set -euo pipefail
+
+SSID="${OMAWIFI_SSID:-}"                         # empty = the Wi-Fi network in use
+IFACE="${OMAWIFI_IFACE:-}"
+PROFILE="${OMAWIFI_PROFILE:-}"
+BAND="${OMAWIFI_BAND:-a}"                        # a = 5 GHz, bg = 2.4 GHz, auto
+VERIFY_TRIES="${OMAWIFI_VERIFY_TRIES:-15}"       # 15 x 0.4 s association check
+TIE_WINDOW="${OMAWIFI_TIE_WINDOW:-3}"            # signal points where tie-breaks apply
+MAX_CANDIDATES="${OMAWIFI_MAX_CANDIDATES:-3}"    # APs to try before giving up
+
+DRY_RUN=0; RESCAN=1; TSV=0; QUIET=0; PIN_BAND=0; SIMPLE=0; ALL_BANDS=0; JSON_MODE=0
+SUDO=()          # lazily resolved privilege prefix
+SCAN_CACHED=0    # 1 when the forced rescan was refused (remote/headless session)
+
+# ------------------------------------------------------------------ output --
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+	C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_DIM=$'\033[2m'; C_OFF=$'\033[0m'
+else
+	C_OK=''; C_WARN=''; C_ERR=''; C_DIM=''; C_OFF=''
+fi
+
+log()  { if (( QUIET == 0 )); then printf '%s\n' "$*"; fi; }
+warn() { printf '%somawifi: %s%s\n' "$C_WARN" "$*" "$C_OFF" >&2; }
+# In JSON mode (the plugin) a verdict on stdout beats a message on stderr: the
+# bar parses stdout, so a refusal has to arrive as a document it can render.
+# `ui` is a query, and "nothing usable to report" is one of its valid answers,
+# so it exits 0 with that document instead of failing.
+die()  {
+	local msg="${*//\"/}"; msg="${msg//\\/}"
+	if (( JSON_MODE )); then
+		printf '{"ok":false,"state":"offline","error":"%s"}\n' "$msg"
+		printf '%somawifi: %s%s\n' "$C_ERR" "$*" "$C_OFF" >&2
+		exit 0
+	fi
+	printf '%somawifi: %s%s\n' "$C_ERR" "$*" "$C_OFF" >&2
+	exit 1
+}
+usage() { awk 'NR>2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
+
+# ------------------------------------------------------------- nmcli bits --
+# Run nmcli, escalating only when polkit refuses (remote or headless session).
+# Started from the shell's own bar plugin the call is already authorized, so the
+# escalation is a fallback for a terminal that has no seat.
+nm_priv() {
+	local out rc
+	set +e
+	out="$(nmcli "$@" 2>&1)"; rc=$?
+	set -e
+	if (( rc == 0 )); then printf '%s\n' "$out"; return 0; fi
+	if printf '%s' "$out" | grep -qiE 'not authorized|insufficient priv|access denied'; then
+		if (( ${#SUDO[@]} == 0 )) && sudo -n true 2>/dev/null; then SUDO=(sudo -n); fi
+		if (( ${#SUDO[@]} > 0 )); then
+			set +e
+			out="$("${SUDO[@]}" nmcli "$@" 2>&1)"; rc=$?
+			set -e
+			if (( rc == 0 )); then printf '%s\n' "$out"; return 0; fi
+		fi
+		if [[ -t 0 && -t 1 ]] && command -v sudo >/dev/null 2>&1; then
+			if sudo nmcli "$@"; then return 0; fi
+		fi
+		printf 'omawifi: needs privilege for "%s" (run it from the desktop session, or allow sudo)\n' "$*" >&2
+		return 1
+	fi
+	printf '%s\n' "$out" >&2
+	return "$rc"
+}
+
+# Resolve the Wi-Fi device. Sets IFACE; refuses at top level (a refusal inside a
+# command substitution could neither stop the script nor keep its message out of
+# the captured value).
+resolve_iface() {
+	if [[ -n "$IFACE" ]]; then return 0; fi
+	local d
+	d="$(nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '$2=="wifi"{print $1; exit}' || true)"
+	if [[ -z "$d" ]]; then die "no Wi-Fi device found"; fi
+	IFACE="$d"
+}
+
+# The Wi-Fi connection that is up right now, if any.
+active_wifi_uuid() {
+	{ nmcli -t -f UUID,TYPE,ACTIVE con show --active 2>/dev/null || true; } \
+		| awk -F: '$2=="802-11-wireless" && $3=="yes"{print $1; exit}'
+}
+
+# Resolve the connection profile to pin. Sets PROFILE_UUID_ and, when the caller
+# did not name an SSID, reads it off the profile. Called at top level on purpose:
+# see resolve_iface.
+resolve_profile() {
+	local u rc=0
+	if [[ -n "$PROFILE" ]]; then
+		set +e
+		u="$(nmcli -t -g connection.uuid con show "$PROFILE" 2>/dev/null | tr -d ' \n')"
+		rc=$?
+		set -e
+		if (( rc != 0 )) || [[ -z "$u" ]]; then die "OMAWIFI_PROFILE '$PROFILE' is not a known connection"; fi
+		PROFILE_UUID_="$u"
+	elif [[ -n "$SSID" ]]; then
+		u="$(nmcli -t -f NAME,UUID,TYPE con show 2>/dev/null \
+			| awk -F: -v s="$SSID" '$1==s && $3=="802-11-wireless"{print $2; exit}' || true)"
+		if [[ -z "$u" ]]; then die "no NetworkManager Wi-Fi profile for SSID '$SSID'"; fi
+		PROFILE_UUID_="$u"
+	else
+		# No SSID given: follow the network this machine is on. With the radio
+		# off there is nothing to follow, so a sole saved Wi-Fi profile stands in
+		# for it (guess-free: with several saved networks the caller must say
+		# which one it means).
+		u="$(active_wifi_uuid)"
+		if [[ -z "$u" ]]; then
+			local all
+			all="$(nmcli -t -f UUID,TYPE con show 2>/dev/null \
+				| awk -F: '$2=="802-11-wireless"{print $1}' | tr '\n' ' ' || true)"
+			all="${all% }"      # one trailing space from tr, not a field separator
+			if [[ -z "$all" || "$all" == *" "* ]]; then
+				die "no active Wi-Fi connection, and no single saved Wi-Fi profile to fall back on (set OMAWIFI_SSID, or the plugin's SSID setting)"
+			fi
+			u="$all"
+		fi
+		PROFILE_UUID_="$u"
+	fi
+	if [[ -z "$SSID" ]]; then
+		SSID="$(nm_text "$PROFILE_UUID_" 802-11-wireless.ssid)"
+		if [[ -z "$SSID" ]]; then die "could not read the SSID of profile $PROFILE_UUID_"; fi
+	fi
+}
+
+# Never dump the whole profile: the PSK lives in there. Single fields only.
+# nmcli escapes ':' in -g output (18\:A6\:...), so ask for raw and strip both.
+nm_field() {   # $1 = profile uuid, $2 = field  (whitespace inside the value is padding)
+	local v
+	v="$(nmcli --escape no -g "$2" con show "$1" 2>/dev/null | tr -d '\\ \n' || true)"
+	if [[ "$v" == "--" ]]; then v=""; fi
+	printf '%s' "$v"
+}
+
+# Same, but for values that may contain spaces (an SSID is free text). Only the
+# surrounding padding nmcli adds is removed.
+nm_text() {    # $1 = profile uuid, $2 = field
+	local v
+	v="$({ nmcli --escape no -g "$2" con show "$1" 2>/dev/null || true; } | head -n1)"
+	v="${v#"${v%%[![:space:]]*}"}"
+	v="${v%"${v##*[![:space:]]}"}"
+	printf '%s' "$v"
+}
+
+pinned_bssid() {
+	printf '%s' "$(nm_field "$1" 802-11-wireless.bssid)" | tr 'a-f' 'A-F'
+}
+
+pinned_band() {
+	nm_field "$1" 802-11-wireless.band
+}
+
+current_bssid() {   # what the radio is actually associated with right now
+	local out
+	if command -v iw >/dev/null 2>&1; then
+		out="$(iw dev "$IFACE" link 2>/dev/null | awk '/Connected to/{print $3; exit}' || true)"
+		if [[ -n "$out" ]]; then printf '%s' "$out" | tr 'a-f' 'A-F'; return 0; fi
+	fi
+	nmcli -m multiline -f IN-USE,BSSID dev wifi list 2>/dev/null \
+		| awk 'BEGIN{RS="";FS="\n"} {iu="";b="";for(i=1;i<=NF;i++){if($i ~ /^IN-USE:/)iu=substr($i,8);if($i ~ /^BSSID:/)b=substr($i,7)} if(iu ~ /\*/) print b}' \
+		| tr 'a-f' 'A-F' || true
+}
+
+current_dbm() {
+	iw dev "$IFACE" link 2>/dev/null | awk '/signal:/{print $2; exit}' || true
+}
+
+# ------------------------------------------------------------------ scan ---
+SCAN_FIELDS="IN-USE,SSID,BSSID,SIGNAL,FREQ,CHAN,RATE"
+SCAN_DONE=0
+SCAN_OUT=""
+
+# nmcli wants its global options (-m, -f) *before* the command words.
+nm_list() {   # $1 = "force" to ask for a fresh scan; prints output, returns rc
+	local out rc=0
+	if [[ "${1:-}" == force ]]; then
+		set +e; out="$(nmcli -m multiline -f "$SCAN_FIELDS" dev wifi list --rescan yes 2>&1)"; rc=$?
+		set -e
+	else
+		set +e; out="$(nmcli -m multiline -f "$SCAN_FIELDS" dev wifi list 2>&1)"; rc=$?
+		set -e
+	fi
+	printf '%s\n' "$out"
+	return "$rc"
+}
+
+# Keep only real scan data: nmcli mixes "Error: ..." lines into stdout when we
+# capture 2>&1, and those must never reach the TSV parser.
+scan_clean() { printf '%s\n' "$1" | grep -v '^Error:' || true; }
+
+# One scan per run, reused by every later lookup.
+scan_fetch() {
+	(( SCAN_DONE )) && return 0
+	local out rc=0 err=""
+	if (( RESCAN )); then
+		set +e; out="$(nm_list force)"; rc=$?; set -e
+		if (( rc != 0 )); then
+			if printf '%s' "$out" | grep -qiE 'not authorized|insufficient priv'; then
+				SCAN_CACHED=1
+				if (( ${#SUDO[@]} == 0 )) && sudo -n true 2>/dev/null; then SUDO=(sudo -n); fi
+				if (( ${#SUDO[@]} > 0 )); then
+					set +e; out="$("${SUDO[@]}" nmcli -m multiline -f "$SCAN_FIELDS" dev wifi list --rescan yes 2>&1)"; rc=$?
+					set -e
+				fi
+			fi
+			if (( rc != 0 )); then
+				err="$(printf '%s\n' "$out" | awk '/^Error:/{print; exit}')"
+				if ! printf '%s' "$err" | grep -qi 'immediately following previous scan'; then
+					warn "no fresh scan allowed in this session (polkit wants a local seat): ${err:-scan failed}"
+					SCAN_CACHED=1
+				fi
+			fi
+		fi
+	fi
+	if (( rc != 0 )) || ! printf '%s' "$out" | grep -q '^BSSID:'; then
+		if (( RESCAN == 0 )); then SCAN_CACHED=1; fi
+		set +e; out="$(nm_list cached)"; rc=$?; set -e
+		if (( rc != 0 )); then
+			warn "reading the AP list failed: $(printf '%s\n' "$out" | awk '/^Error:/{print; exit}')"
+			out=""
+		fi
+	fi
+	SCAN_OUT="$(scan_clean "$out")"
+	SCAN_DONE=1
+}
+
+# One TSV row per visible AP: signal% rate freq chan band bssid in-use ssid
+# nmcli prints AP blocks back to back with no blank line between them, so this
+# is a line state machine that emits a record whenever a new block starts.
+scan_raw() {
+	scan_fetch
+	printf '%s\n' "$SCAN_OUT" | awk '
+		function trim(v) { gsub(/^[ \t]+|[ \t]+$/, "", v); return v }
+		function emit() {
+			if (bssid == "") return
+			band = (freq + 0 >= 4000) ? "5G" : "2G"
+			printf "%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n", \
+				sig + 0, rate + 0, freq + 0, chan, band, bssid, inuse, ssid
+		}
+		/^IN-USE:/ { emit(); sig=-1; rate=0; freq=0; chan=""; bssid=""; inuse=trim(substr($0,8)); next }
+		/^SSID:/   { ssid = trim(substr($0, 6)); next }
+		/^BSSID:/  { bssid = trim(substr($0, 7)); next }
+		/^SIGNAL:/ { sig = trim(substr($0, 8)); next }
+		/^FREQ:/   { freq = trim(substr($0, 6)); next }
+		/^CHAN:/   { chan = trim(substr($0, 6)); next }
+		/^RATE:/   { rate = trim(substr($0, 6)); next }
+		END { emit() }'
+}
+
+# Rank candidates of $SSID on band $1. Score = signal with coarse tie-breaks that
+# only bite inside the tie window, so the strongest AP still wins outright:
+#   - subtract the number of nearby other APs (within one 20 MHz channel step)
+#   - subtract a small penalty for DFS channels (radar-triggered re-association)
+# nmcli does not report channel width, so congestion is a coarse count only.
+rank_candidates() {
+	scan_raw | awk -F'\t' -v s="$SSID" -v w="$1" -v tie="$TIE_WINDOW" -v simple="$SIMPLE" '
+		{ row[NR] = $0; n = NR }
+		END {
+			best = -1
+			for (i = 1; i <= n; i++) {
+				split(row[i], f, "\t")
+				if (f[8] != s) continue
+				if (w != "any" && f[5] != w) continue
+				if (f[1] + 0 > best) best = f[1] + 0
+			}
+			for (i = 1; i <= n; i++) {
+				split(row[i], f, "\t")
+				if (f[8] != s) continue
+				if (w != "any" && f[5] != w) continue
+				score = f[1] + 0
+				if (!simple && score >= best - tie) {
+					occ = 0
+					for (j = 1; j <= n; j++) {
+						if (j == i) continue
+						split(row[j], g, "\t")
+						d = g[3] + 0 - (f[3] + 0); if (d < 0) d = -d
+						if (d <= 10) occ++
+					}
+					if (occ > 6) occ = 6
+					score -= occ
+					ch = f[4] + 0
+					if ((ch >= 52 && ch <= 64) || (ch >= 100 && ch <= 144)) score -= 4
+				}
+				printf "%d\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", score, f[1], f[2], f[3], f[4], f[5], f[6], f[7], f[8]
+			}
+		}' | sort -t$'\t' -k1,1nr -k2,2nr
+}
+
+# -------------------------------------------------------------- mutation ---
+pin_bssid() {   # $1 = bssid, $2 = its band (5G|2G|"") for consistency checks
+	local bssid="$1" apband="${2:-}" args=() cur_band band_want=""
+	if [[ "$(pinned_bssid "$PROFILE_UUID_")" != "$bssid" ]]; then
+		args+=(802-11-wireless.bssid "$bssid")
+	fi
+	cur_band="$(pinned_band "$PROFILE_UUID_")"
+	(( PIN_BAND )) && band_want="$BAND_PIN"
+	# A band pinned earlier (or via --pin-band) must match the AP we bind to,
+	# otherwise the profile would ask for a BSSID that its band forbids.
+	if [[ -n "$band_want" && "$cur_band" != "$band_want" ]]; then
+		args+=(802-11-wireless.band "$band_want")
+	elif [[ -n "$cur_band" && -n "$apband" ]]; then
+		case "$apband:$cur_band" in
+			5G:a|2G:bg) ;;
+			5G:bg) args+=(802-11-wireless.band a) ;;
+			2G:a)  args+=(802-11-wireless.band bg) ;;
+		esac
+	fi
+	if (( ${#args[@]} == 0 )); then
+		log "${C_DIM}profile already pins ${bssid}, no profile change needed${C_OFF}"
+		return 0
+	fi
+	if (( DRY_RUN )); then
+		log "DRY-RUN: nmcli con mod $PROFILE_UUID_ ${args[*]}"
+		return 0
+	fi
+	nm_priv con mod "$PROFILE_UUID_" "${args[@]}" >/dev/null
+	local suffix=""
+	(( PIN_BAND )) && suffix=" (band pinned too)"
+	log "pin set to ${bssid}${suffix}"
+}
+
+reactivate() {
+	if (( DRY_RUN )); then
+		log "DRY-RUN: nmcli --wait 20 con up $PROFILE_UUID_"
+		return 0
+	fi
+	nm_priv --wait 20 con up "$PROFILE_UUID_" >/dev/null
+}
+
+wait_for_bssid() {   # $1 = bssid
+	local i
+	for (( i = 0; i < VERIFY_TRIES; i++ )); do
+		if [[ "$(current_bssid)" == "$1" ]]; then return 0; fi
+		sleep 0.4
+	done
+	return 1
+}
+
+# ------------------------------------------- machine readable snapshot (ui) --
+# One JSON object. Written by awk so the only requirement is the awk every
+# Arch box already has; strings are escaped properly, so an SSID with a quote
+# or a backslash in it cannot corrupt the document.
+emit_snapshot() {   # $1 = ranked rows (TSV), $2 = include 2.4 GHz (0/1)
+	local rows="$1" cur pin band dbm sig rate freq chan state="offline" sliced=""
+	cur="$(current_bssid)"; pin="$(pinned_bssid "$PROFILE_UUID_")"
+	band="$(pinned_band "$PROFILE_UUID_")"; dbm="$(current_dbm)"
+
+	if [[ -n "$cur" && "$cur" == "$pin" ]]; then state="locked"
+	elif [[ -n "$pin" && -n "$cur" ]]; then state="drifted"
+	elif [[ -n "$cur" ]]; then state="roaming"
+	fi
+
+	# Which of the visible APs is the one in use, so the bar can show its signal.
+	if [[ -n "$cur" ]]; then
+		sliced="$(printf '%s\n' "$rows" | awk -F'\t' -v b="$cur" '$7==b{print $2"\t"$3"\t"$4"\t"$5; exit}')"
+		sig="${sliced%%$'\t'*}"; sliced="${sliced#*$'\t'}"
+		rate="${sliced%%$'\t'*}"; sliced="${sliced#*$'\t'}"
+		freq="${sliced%%$'\t'*}"; sliced="${sliced#*$'\t'}"
+		chan="${sliced}"
+	fi
+
+	printf '%s\n' "$rows" | awk -F'\t' \
+		-v iface="$IFACE" -v ssid="$SSID" -v profile="$PROFILE_UUID_" \
+		-v pin="$pin" -v band="$band" -v cur="$cur" -v dbm="$dbm" -v state="$state" \
+		-v sig="${sig:-}" -v rate="${rate:-}" -v freq="${freq:-}" -v chan="${chan:-}" \
+		-v cached="$SCAN_CACHED" -v allbands="$2" '
+		function esc(v) {
+			gsub(/\\/, "\\\\", v)
+			gsub(/"/, "\\\"", v)
+			gsub(/\t/, " ", v)
+			gsub(/\r/, "", v)
+			gsub(/\n/, " ", v)
+			return v
+		}
+		function num(v) { return (v == "" ? "null" : v + 0) }
+		{ if ($7 == "") next
+		  ap = ap (n++ ? "," : "") "{\"bssid\":\"" esc($7) "\""
+		  ap = ap ",\"signal\":" $2 + 0 ",\"rate\":" $3 + 0 ",\"freq\":" $4 + 0
+		  ap = ap ",\"chan\":\"" esc($5) "\",\"band\":\"" esc($6) "\""
+		  ap = ap ",\"score\":" $1 + 0
+		  ap = ap ",\"inUse\":" ($8 ~ /\*/ ? "true" : "false")
+		  ap = ap ",\"current\":" ($7 == cur ? "true" : "false")
+		  ap = ap ",\"pinned\":" (pin != "" && $7 == pin ? "true" : "false") "}"
+		  if (n == 1) first = $7
+		}
+		END {
+			printf "{\"ok\":true,\"iface\":\"%s\",\"ssid\":\"%s\",\"profile\":\"%s\"", esc(iface), esc(ssid), esc(profile)
+			printf ",\"pinned\":\"%s\",\"bandPin\":\"%s\",\"current\":\"%s\"", esc(pin), esc(band), esc(cur)
+			printf ",\"dbm\":%s,\"signal\":%s,\"rate\":%s,\"freq\":%s,\"chan\":%s", \
+				num(dbm), num(sig), num(rate), num(freq), num(chan)
+			printf ",\"state\":\"%s\",\"best\":\"%s\",\"cached\":%s,\"allBands\":%s", \
+				esc(state), esc(first), (cached + 0 ? "true" : "false"), (allbands + 0 ? "true" : "false")
+			printf ",\"aps\":[%s]}\n", ap
+		}'
+}
+
+# ------------------------------------------------------------------ views --
+# Refresh the scan, warn once when this session is not allowed to trigger one.
+scan_or_die() {
+	local filter="$1" rows where=""
+	[[ "$filter" == "any" ]] || where=" on band $filter"
+	rows="$(rank_candidates "$filter")"
+	if [[ -z "$rows" ]]; then
+		if (( SCAN_CACHED )); then
+			warn "no AP of '$SSID'${where} in the cached scan — run omawifi from the desktop session for a fresh scan"
+		else
+			warn "no AP of '$SSID'${where} visible"
+		fi
+		return 1
+	fi
+	printf '%s' "$rows"
+}
+
+cmd_list() {
+	local rows cur pin table="" filter="$BAND_FILTER" label="band $BAND_FILTER"
+	(( ALL_BANDS )) && { filter="any"; label="every band"; }
+	rows="$(scan_or_die "$filter")" || exit 1
+	cur="$(current_bssid)"; pin="$(pinned_bssid "$PROFILE_UUID_")"
+
+	if (( TSV )); then
+		printf '%s\n' "$rows" | awk -F'\t' -v OFS='\t' -v c="$cur" -v p="$pin" '
+			{ m=""; if ($7==c) m="current"; if ($7==p) m=(m=="" ? "pinned" : m"+pinned");
+			  if ($8 ~ /\*/) m=(m=="" ? "nm" : m"+nm")
+			  print $1,$2,$3,$4,$5,$6,$7,$9,m }' || true
+		return 0
+	fi
+
+	# Assemble first, print once: piping a row loop into head would raise SIGPIPE.
+	printf -v table 'SSID %s — %s AP(s) on %s, best first\n' \
+		"\"$SSID\"" "$(printf '%s\n' "$rows" | wc -l | tr -d ' ')" "$label"
+	printf -v table '%s%-7s %-7s %-7s %-4s %-3s %-18s %-6s %s\n' \
+		"$table" SIGNAL RATE FREQ CHAN BAND BSSID STATE SCORE
+	while IFS=$'\t' read -r score sig rate freq chan band bssid inuse ssid; do
+		local state=""
+		[[ "$bssid" == "$cur" ]] && state="current"
+		[[ "$bssid" == "$pin" ]] && state="${state:+$state+}pinned"
+		[[ -n "$inuse" ]] && state="${state:+$state+}nm"
+		printf -v table '%s%-7s %-7s %-7s %-4s %-3s %-18s %-6s %s\n' \
+			"$table" "${sig}%" "${rate}M" "$freq" "$chan" "$band" "$bssid" "$state" "$score"
+	done <<< "$rows"
+	printf '%s' "$table" || exit 0
+}
+
+cmd_status() {
+	local cur pin band dbm
+	cur="$(current_bssid)"; pin="$(pinned_bssid "$PROFILE_UUID_")"; band="$(pinned_band "$PROFILE_UUID_")"
+	dbm="$(current_dbm)"
+	printf 'iface    %s\n' "$IFACE"
+	printf 'ssid     %s\n' "$SSID"
+	printf 'profile  %s\n' "$PROFILE_UUID_"
+	printf 'pinned   %s\n' "${pin:-none (NetworkManager roams freely)}"
+	printf 'band pin %s\n' "${band:-none (auto)}"
+	printf 'current  %s%s\n' "${cur:-none}" "${dbm:+ (${dbm})}"
+	if [[ -n "$cur" && "$cur" == "$pin" ]]; then
+		printf 'state    %slocked on the pinned AP%s\n' "$C_OK" "$C_OFF"
+	elif [[ -n "$pin" ]]; then
+		printf 'state    %sdrifted off the pinned AP — run omawifi%s\n' "$C_WARN" "$C_OFF"
+	elif [[ -n "$cur" ]]; then
+		printf 'state    automatic roaming (no pin)\n'
+	else
+		printf 'state    %snot associated%s\n' "$C_ERR" "$C_OFF"
+	fi
+}
+
+cmd_ui() {
+	local filter="any"
+	(( ALL_BANDS )) || filter="$BAND_FILTER"
+	# Rows are optional here: an empty scan is a valid state for the plugin
+	# (it shows "no AP visible"), not an error worth exiting on.
+	emit_snapshot "$(rank_candidates "$filter" || true)" "$ALL_BANDS"
+}
+
+cmd_auto() {
+	local old
+	old="$(pinned_bssid "$PROFILE_UUID_")"
+	if (( DRY_RUN )); then
+		log "DRY-RUN: nmcli con mod $PROFILE_UUID_ 802-11-wireless.bssid '' 802-11-wireless.band ''"
+		return 0
+	fi
+	nm_priv con mod "$PROFILE_UUID_" 802-11-wireless.bssid "" 802-11-wireless.band "" >/dev/null
+	log "pin cleared (was ${old:-none}) — NetworkManager roams freely again"
+}
+
+# Bind to one named AP, the way the plugin's panel does it: pin, reactivate,
+# verify, and put the previous pin back if the radio will not come up on it.
+cmd_bind() {
+	local want="${1:-}" old cur apband=""
+	[[ -n "$want" ]] || die "bind needs a BSSID (try: omawifi list)"
+	want="$(printf '%s' "$want" | tr 'a-f' 'A-F')"
+	if [[ ! "$want" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]; then die "not a BSSID: '$want'"; fi
+
+	old="$(pinned_bssid "$PROFILE_UUID_")"
+	cur="$(current_bssid)"
+	apband="$(scan_raw | awk -F'\t' -v b="$want" '$6==b{print $5; exit}')"
+	if [[ -z "$apband" ]]; then
+		die "$want is not visible right now — refresh the list and pick an AP that is"
+	fi
+
+	if [[ "$want" == "$cur" ]]; then
+		pin_bssid "$want" "$apband"          # already associated: refresh the pin only
+		(( DRY_RUN )) && return 0
+		log "${C_OK}already on ${want}${C_OFF} — the pin now points at it"
+		return 0
+	fi
+
+	log "binding ${want} (band ${apband})"
+	pin_bssid "$want" "$apband"
+	if (( DRY_RUN )); then log "DRY-RUN finished, nothing was changed"; return 0; fi
+	if reactivate && wait_for_bssid "$want"; then
+		log "${C_OK}bound to ${want} ($(current_dbm))${C_OFF}"
+		return 0
+	fi
+	warn "could not associate to ${want}; restoring the previous pin ${old:-none}"
+	if [[ -n "$old" ]]; then
+		nm_priv con mod "$PROFILE_UUID_" 802-11-wireless.bssid "$old" >/dev/null || true
+		reactivate || true
+	fi
+	return 1
+}
+
+# ----------------------------------------------------------------- switch --
+cmd_switch() {
+	local want="$1" rows best best_sig best_band cur pin old cands apband bssid n=0 ok=0
+	pin="$(pinned_bssid "$PROFILE_UUID_")"
+	rows="$(scan_or_die "$want")" || {
+		warn "nothing bound, the current pin (${pin:-none}) is untouched"
+		return 1
+	}
+
+	cur="$(current_bssid)"; pin="$(pinned_bssid "$PROFILE_UUID_")"; old="$pin"
+	best="$(printf '%s\n' "$rows" | awk -F'\t' 'NR==1{print $7}')"
+	best_sig="$(printf '%s\n' "$rows" | awk -F'\t' 'NR==1{print $2}')"
+	best_band="$(printf '%s\n' "$rows" | awk -F'\t' 'NR==1{print $6}')"
+
+	if [[ "$best" == "$cur" && "$best" == "$pin" ]]; then
+		log "${C_OK}already on the strongest ${want} AP${C_OFF} ${best} (${best_sig}%, $(current_dbm)) — nothing to do  ${C_DIM}${SECONDS}s${C_OFF}"
+		return 0
+	fi
+	log "best ${want} AP: ${best} (${best_sig}%)" \
+		"${pin:+| pinned ${pin}}${cur:+ | current ${cur}}"
+
+	if [[ "$best" == "$cur" ]]; then
+		pin_bssid "$best" "$best_band"     # already associated, just refresh the pin
+		ok=1
+	elif [[ "$best" == "$pin" ]]; then
+		log "pin already correct, forcing re-association onto ${best}"
+		if reactivate && wait_for_bssid "$best"; then ok=1; fi
+	fi
+
+	if (( ok == 0 )); then
+		cands="$(printf '%s\n' "$rows" | awk -F'\t' -v m="$MAX_CANDIDATES" 'NR<=m{print $6"\t"$7}' | awk -F'\t' '!seen[$2]++')"
+		while IFS=$'\t' read -r apband bssid; do
+			[[ -n "$bssid" ]] || continue
+			n=$(( n + 1 ))
+			log "try ${n}: bind ${bssid}"
+			pin_bssid "$bssid" "$apband"
+			if (( DRY_RUN )); then ok=1; break; fi
+			if reactivate && wait_for_bssid "$bssid"; then ok=1; break; fi
+			warn "associating to ${bssid} failed, trying the next one"
+		done <<< "$cands"
+	fi
+
+	if (( ok == 0 )) && [[ "$want" != "any" ]]; then
+		# Last resort: the other band beats being offline, and the band pin (if any)
+		# has to follow the AP we are actually binding to.
+		local alt alt_bssid alt_sig
+		if [[ "$want" == "5G" ]]; then alt="2G"; BAND_PIN="bg"; else alt="5G"; BAND_PIN="a"; fi
+		alt_bssid="$(rank_candidates "$alt" | awk -F'\t' -v c="$cur" '$7!=c{print $7; exit}')"
+		alt_sig="$(rank_candidates "$alt" | awk -F'\t' -v c="$cur" '$7!=c{print $2; exit}')"
+		if [[ -n "$alt_bssid" ]]; then
+			warn "no ${want} AP would associate; falling back to ${alt} ${alt_bssid} (${alt_sig}%)"
+			pin_bssid "$alt_bssid" "$alt"
+			reactivate && wait_for_bssid "$alt_bssid" && ok=1
+		fi
+	fi
+
+	if (( ok == 0 )); then
+		warn "could not associate to any candidate; restoring previous pin ${old:-none}"
+		if [[ -n "$old" ]]; then
+			nm_priv con mod "$PROFILE_UUID_" 802-11-wireless.bssid "$old" >/dev/null || true
+			reactivate || true
+		fi
+		return 1
+	fi
+
+	if (( DRY_RUN )); then log "DRY-RUN finished, nothing was changed"; return 0; fi
+	cur="$(current_bssid)"
+	if [[ "$cur" == "$(pinned_bssid "$PROFILE_UUID_")" ]]; then
+		log "${C_OK}bound to ${cur} (${best_sig}%, $(current_dbm)) in ${SECONDS}s${C_OFF}"
+	else
+		warn "pin is set but the radio reports ${cur:-disconnected}"
+		return 1
+	fi
+}
+
+# ------------------------------------------------------------------- main --
+# Flags may come before or after the command (omawifi list --tsv works).
+SUB=""
+_POS=()
+_ARGS=("$@"); _i=0
+while (( _i < ${#_ARGS[@]} )); do
+	_a="${_ARGS[$_i]}"
+	case "$_a" in
+		-n|--dry-run) DRY_RUN=1 ;;
+		--fast)       RESCAN=0 ;;
+		--tsv)        TSV=1 ;;
+		--all)        ALL_BANDS=1 ;;
+		-q|--quiet)   QUIET=1 ;;
+		--pin-band)   PIN_BAND=1 ;;
+		--simple)     SIMPLE=1 ;;
+		--band)       _i=$(( _i + 1 )); BAND="${_ARGS[$_i]:?--band needs a, bg or auto}" ;;
+		-h|--help)    usage; exit 0 ;;
+		--)           break ;;
+		-*)           die "unknown flag: $_a (try --help)" ;;
+		*)            if [[ -z "$SUB" ]]; then SUB="$_a"; else _POS+=("$_a"); fi ;;
+	esac
+	_i=$(( _i + 1 ))
+done
+
+case "$BAND" in
+	a|5|5g|5G)   BAND_FILTER=5G; BAND_PIN=a ;;
+	bg|2|2g|2G)  BAND_FILTER=2G; BAND_PIN=bg ;;
+	auto|any|"") BAND_FILTER=any; BAND_PIN="" ;;
+	*)           die "bad band '$BAND' (use a, bg or auto)" ;;
+esac
+if (( RESCAN == 0 )); then SCAN_CACHED=1; fi
+
+# From here on a refusal must still be readable by the plugin.
+case "${SUB:-switch}" in
+	ui|json|ui-all) JSON_MODE=1 ;;
+esac
+
+command -v nmcli >/dev/null 2>&1 || die "nmcli not found"
+resolve_profile
+resolve_iface
+
+case "${SUB:-switch}" in
+	status)     cmd_status ;;
+	list|ls)    cmd_list ;;
+	ui|json)    cmd_ui ;;
+	ui-all)     ALL_BANDS=1; cmd_ui ;;
+	auto|roam)  cmd_auto ;;
+	bind|use|pin) cmd_bind "${_POS[0]:-}" ;;
+	switch|go|"") cmd_switch "$BAND_FILTER" ;;
+	*)          die "unknown command '$SUB' (switch|list|status|bind|ui|auto)" ;;
+esac
