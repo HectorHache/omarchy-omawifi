@@ -48,7 +48,6 @@ TIE_WINDOW="${OMAWIFI_TIE_WINDOW:-3}"            # signal points where tie-break
 MAX_CANDIDATES="${OMAWIFI_MAX_CANDIDATES:-3}"    # APs to try before giving up
 
 DRY_RUN=0; RESCAN=1; TSV=0; QUIET=0; PIN_BAND=0; SIMPLE=0; ALL_BANDS=0; JSON_MODE=0
-SUDO=()          # lazily resolved privilege prefix
 SCAN_CACHED=0    # 1 when the forced rescan was refused (remote/headless session)
 
 # ------------------------------------------------------------------ output --
@@ -77,9 +76,10 @@ die()  {
 usage() { awk 'NR>2 { if ($0 !~ /^#/) exit; sub(/^# ?/, ""); print }' "$0"; }
 
 # ------------------------------------------------------------- nmcli bits --
-# Run nmcli, escalating only when polkit refuses (remote or headless session).
-# Started from the shell's own bar plugin the call is already authorized, so the
-# escalation is a fallback for a terminal that has no seat.
+# Run nmcli directly. Launched from the bar widget, the Quickshell process is
+# polkit-authorized for the NetworkManager actions this plugin uses, so no
+# privilege escalation is needed. A seat-less terminal that polkit refuses gets
+# a clear message instead.
 nm_priv() {
 	local out rc
 	set +e
@@ -87,17 +87,7 @@ nm_priv() {
 	set -e
 	if (( rc == 0 )); then printf '%s\n' "$out"; return 0; fi
 	if printf '%s' "$out" | grep -qiE 'not authorized|insufficient priv|access denied'; then
-		if (( ${#SUDO[@]} == 0 )) && sudo -n true 2>/dev/null; then SUDO=(sudo -n); fi
-		if (( ${#SUDO[@]} > 0 )); then
-			set +e
-			out="$("${SUDO[@]}" nmcli "$@" 2>&1)"; rc=$?
-			set -e
-			if (( rc == 0 )); then printf '%s\n' "$out"; return 0; fi
-		fi
-		if [[ -t 0 && -t 1 ]] && command -v sudo >/dev/null 2>&1; then
-			if sudo nmcli "$@"; then return 0; fi
-		fi
-		printf 'omawifi: needs privilege for "%s" (run it from the desktop session, or allow sudo)\n' "$*" >&2
+		printf 'omawifi: not authorized for "%s" — run it from the desktop session, where the Quickshell bar is polkit-authorized\n' "$*" >&2
 		return 1
 	fi
 	printf '%s\n' "$out" >&2
@@ -236,11 +226,6 @@ scan_fetch() {
 		if (( rc != 0 )); then
 			if printf '%s' "$out" | grep -qiE 'not authorized|insufficient priv'; then
 				SCAN_CACHED=1
-				if (( ${#SUDO[@]} == 0 )) && sudo -n true 2>/dev/null; then SUDO=(sudo -n); fi
-				if (( ${#SUDO[@]} > 0 )); then
-					set +e; out="$("${SUDO[@]}" nmcli -m multiline -f "$SCAN_FIELDS" dev wifi list --rescan yes 2>&1)"; rc=$?
-					set -e
-				fi
 			fi
 			if (( rc != 0 )); then
 				err="$(printf '%s\n' "$out" | awk '/^Error:/{print; exit}')"
